@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Bridge Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-bridge
+ExecStart=/root/telegram-bridge/venv/bin/python main.py
+Restart=always
+RestartSec=5
+Environment=PATH=/root/telegram-bridge/venv/bin:/usr/local/bin:/usr/bin
+
+[Install]
+WantedBy=multi-user.target
