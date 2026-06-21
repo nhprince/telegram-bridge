@@ -407,6 +407,9 @@ async def get_file_info(
     if not upload:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Strip binary fields that can't be JSON-serialized
+    upload.pop("file_reference", None)
+
     # Try cache first, then fall back to Bot API
     download_url = url_cache.get(file_unique_id)
     if not download_url:
@@ -450,10 +453,15 @@ async def list_files_endpoint(
         search=search,
     )
 
-    # Add download URLs (from cache when available)
+    # Add download URLs (from cache when available) and strip binary fields
     for f in result["files"]:
         cached_url = url_cache.get(f["file_unique_id"])
         f["download_url"] = cached_url or ""
+        # Remove binary fields that can't be JSON-serialized
+        f.pop("file_reference", None)
+        f.pop("access_hash", None)
+        f.pop("media_id", None)
+        f.pop("dc_id", None)
 
     return FileListResponse(
         success=True,
