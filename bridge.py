@@ -236,9 +236,7 @@ class TelegramBridge:
     async def resolve_file(self, file_id: str) -> dict:
         """
         Get file metadata from file_id via Bot API.
-
-        Returns:
-            dict with file_path, file_size, etc.
+        Falls back to filename-only if Bot API rejects large files.
         """
         import aiohttp
 
@@ -248,38 +246,63 @@ class TelegramBridge:
         token = BOT_TOKEN
         api_url = f"https://api.telegram.org/bot{token}/getFile"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(api_url, data={"file_id": file_id}) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    result = data["result"]
-                    return {
-                        "file_id": file_id,
-                        "file_path": result["file_path"],
-                        "file_size": result.get("file_size", 0),
-                        "file_unique_id": result.get("file_unique_id", None),
-                    }
-                raise RuntimeError(f"getFile failed: {data}")
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, data={"file_id": file_id}) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        result = data["result"]
+                        return {
+                            "file_id": file_id,
+                            "file_path": result["file_path"],
+                            "file_size": result.get("file_size", 0),
+                            "file_unique_id": result.get("file_unique_id", None),
+                        }
+                    logger.warning(f"Bot API getFile rejected: {data.get('description', 'unknown')}")
+                    return {"file_id": file_id, "file_path": "", "file_size": 0, "file_unique_id": None}
+        except Exception as e:
+            logger.warning(f"Bot API getFile failed: {e}")
+            return {"file_id": file_id, "file_path": "", "file_size": 0, "file_unique_id": None}
 
     async def get_download_url(self, file_id: str) -> str:
         """
         Get a direct download URL for a file via Bot API.
 
-        Calls getFile via Bot API to get the file_path, then constructs
-        the download URL. The URL is valid for at least 1 hour.
+        Calls getFile via Bot API (HTTP) to get the file_path, then constructs
+        the download URL. Falls back to file_id-only if Bot API rejects large files.
+
+        Note: Bot API getFile has a ~20MB limit. For larger files, the download_url
+        will be empty and the client should use the file_id with MTProxy or stream
+        through the bridge.
         """
         import aiohttp
 
         token = BOT_TOKEN
         api_url = f"https://api.telegram.org/bot{token}/getFile"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(api_url, data={"file_id": file_id}) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    file_path = data["result"]["file_path"]
-                    return f"https://api.telegram.org/file/bot{token}/{file_path}"
-                raise RuntimeError(f"getFile failed: {data}")
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, data={"file_id": file_id}) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        file_path = data["result"]["file_path"]
+                        return f"https://api.telegram.org/file/bot{token}/{file_path}"
+                    # Bot API refused (e.g. "file is too big") — return empty string
+                    # Client should use file_id for MTProto download instead
+                    error_desc = data.get("description", "unknown")
+                    logger.warning(
+                        f"Bot API getFile rejected file_id={file_id}: {error_desc}. "
+                        f"Download URL will be empty — client must use file_id."
+                    )
+                    return ""
+        except asyncio.TimeoutError:
+            logger.warning(f"Bot API getFile timed out for file_id={file_id}")
+            return ""
+        except Exception as e:
+            logger.warning(f"Bot API getFile failed for file_id={file_id}: {e}")
+            return ""
 
     @property
     def _default_channel_id(self) -> int:

@@ -307,8 +307,13 @@ async def upload_file(
     )
 
     # Generate download URL and cache it
-    download_url = await bridge.get_download_url(result["file_id"])
-    url_cache.set(result["file_unique_id"], download_url)
+    download_url = ""
+    try:
+        download_url = await bridge.get_download_url(result["file_id"])
+        if download_url:
+            url_cache.set(result["file_unique_id"], download_url)
+    except Exception as e:
+        logger.warning(f"Could not generate download URL: {e}. Client will use file_id.")
 
     # Dispatch webhook event
     await webhook_manager.dispatch(
