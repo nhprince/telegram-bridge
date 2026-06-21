@@ -1,15 +1,28 @@
 [Unit]
-Description=Telegram Bridge Service
+Description=Telegram Bridge API (Universal File Storage)
 After=network.target
+Wants=network-online.target
 
 [Service]
-Type=simple
-User=root
-WorkingDirectory=/root/telegram-bridge
-ExecStart=/root/telegram-bridge/venv/bin/python main.py
+Type=notify
+User=nhprince
+Group=nhprince
+WorkingDirectory=/home/nhprince/telegram-bridge
+RuntimeDirectory=telegram-bridge
+Environment="PATH=/home/nhprince/telegram-bridge/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStartPre=/usr/bin/mkdir -p /var/log/telegram-bridge /tmp/telegram-bridge-uploads
+ExecStartPre=/usr/bin/chown nhprince:nhprince /var/log/telegram-bridge /tmp/telegram-bridge-uploads
+ExecStart=/home/nhprince/telegram-bridge/venv/bin/gunicorn main:app -c gunicorn.conf.py
+ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5
-Environment=PATH=/root/telegram-bridge/venv/bin:/usr/local/bin:/usr/bin
+KillMode=mixed
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening (minimal — cloudflare tunnel + nginx handles DDoS/SSL)
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

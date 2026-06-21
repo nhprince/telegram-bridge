@@ -32,5 +32,8 @@ CHUNK_SIZE = 512 * 1024  # 512 KB chunks for MTProto uploads
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "change-me-in-production")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
+# Per-app API keys (comma-separated: app_id:key,app_id:key)
+PER_APP_KEYS = os.environ.get("PER_APP_KEYS", "").split(",") if os.environ.get("PER_APP_KEYS") else []
+
 # Database (optional — for tracking uploads)
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "bridge.db")
