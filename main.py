@@ -95,6 +95,52 @@ app.add_middleware(
     expose_headers=["X-Request-ID"],
 )
 
+
+# ─── Global Exception Handler (ensures CORS on all error responses) ─────
+
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Add CORS headers to all HTTP error responses."""
+    origin = request.headers.get("origin", "*")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Add CORS headers to validation error responses (e.g. missing API key)."""
+    origin = request.headers.get("origin", "*")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Add CORS headers to 500 error responses."""
+    origin = request.headers.get("origin", "*")
+    logger.error(f"Unhandled exception: {type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
 # ─── Auth Dependency ──────────────────────────────────────────────────
 
 async def verify_api_key(x_api_key: str = Header(...)):

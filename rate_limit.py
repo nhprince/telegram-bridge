@@ -51,6 +51,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Check upload rate limit
         if request.method == "POST" and "/upload" in request.url.path:
             if len(self._uploads[key]) >= self.upload_rpm:
+                origin = request.headers.get("origin", "*")
                 return JSONResponse(
                     status_code=429,
                     content={
@@ -61,12 +62,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                             "retry_after": 60,
                         }
                     },
-                    headers={"Retry-After": "60"},
+                    headers={
+                        "Retry-After": "60",
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Allow-Credentials": "true",
+                    },
                 )
             self._uploads[key].append(now)
 
         # Check general rate limit
         if len(self._requests[key]) >= self.requests_per_minute:
+            origin = request.headers.get("origin", "*")
             return JSONResponse(
                 status_code=429,
                 content={
@@ -77,7 +83,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                         "retry_after": 60,
                     }
                 },
-                headers={"Retry-After": "60"},
+                headers={
+                    "Retry-After": "60",
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Credentials": "true",
+                },
             )
         self._requests[key].append(now)
 
