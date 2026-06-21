@@ -25,8 +25,11 @@ BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "0.0.0.0")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "9000"))
 
 # Upload Settings
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (Telegram free limit)
+# Max file size: 500 MB (at 0.15 MB/s upload speed, this takes ~55 minutes)
+# Timeout is set to 5400s (90 min) to provide comfortable overhead
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 CHUNK_SIZE = 512 * 1024  # 512 KB chunks for MTProto uploads
+UPLOAD_TIMEOUT = 5400  # 90 minutes in seconds
 
 # Security
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "change-me-in-production")

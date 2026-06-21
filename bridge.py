@@ -7,6 +7,8 @@ import asyncio
 import io
 import logging
 
+from fastapi import HTTPException
+
 # Patch Pyrogram's channel ID limits to support newer Telegram channels
 import pyrogram.utils
 pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
@@ -14,6 +16,7 @@ pyrogram.utils.MIN_CHAT_ID = -2147483648
 
 from pyrogram import Client
 from pyrogram.types import Message
+from pyrogram.errors.exceptions.bad_request_400 import PhotoSaveFileInvalid
 from config import API_ID, API_HASH, BOT_TOKEN
 
 logger = logging.getLogger(__name__)
@@ -101,34 +104,47 @@ class TelegramBridge:
             raise RuntimeError("Bridge client not started. Call start() first.")
 
         channel_id = channel_id or self._default_channel_id
+        file_size = len(file_data)
+
+        # Log upload start with estimated time
+        estimated_seconds = file_size / (0.15 * 1024 * 1024)  # 0.15 MB/s
+        logger.info(
+            f"UPLOAD_START file={file_name} size={file_size} "
+            f"mime={mime_type} est_time={estimated_seconds:.0f}s"
+        )
 
         async with self._upload_semaphore:
             try:
                 # Determine upload method based on file size and type
-                # Telegram Bot API limits: photo=5MB, video=50MB, document=2GB
-                file_size = len(file_data)
                 PHOTO_LIMIT = 5 * 1024 * 1024  # 5 MB
 
                 if mime_type.startswith("image/") and file_size <= PHOTO_LIMIT:
-                    result = await self._upload_photo(
-                        channel_id, file_data, description, progress_callback
-                    )
+                    try:
+                        result = await self._upload_photo(
+                            channel_id, file_data, description, progress_callback
+                        )
+                    except PhotoSaveFileInvalid:
+                        logger.warning(
+                            f"Photo upload rejected for {file_name} "
+                            f"({file_size} bytes), retrying as document"
+                        )
+                        result = await self._upload_document(
+                            channel_id, file_data, description, progress_callback, file_name
+                        )
                 elif mime_type.startswith("video/"):
                     result = await self._upload_video(
                         channel_id, file_data, description, progress_callback
                     )
                 else:
-                    # Large images, documents, and other files go as document
                     result = await self._upload_document(
                         channel_id, file_data, description, progress_callback, file_name
                     )
 
-                # Extract file info from the message's media attachment
                 file_obj = self._extract_media(result)
 
                 logger.info(
-                    f"Uploaded {file_name} ({file_size} bytes) → "
-                    f"file_id={file_obj.file_id}, file_unique_id={file_obj.file_unique_id}"
+                    f"UPLOAD_OK file={file_name} size={file_size} "
+                    f"file_id={file_obj.file_id} file_unique_id={file_obj.file_unique_id}"
                 )
 
                 return {
@@ -142,8 +158,27 @@ class TelegramBridge:
                     "description": description,
                 }
 
+            except PhotoSaveFileInvalid as e:
+                logger.error(
+                    f"UPLOAD_FAILED file={file_name} size={file_size} "
+                    f"mime={mime_type} error=PhotoSaveFileInvalid detail={e}"
+                )
+                raise
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"UPLOAD_TIMEOUT file={file_name} size={file_size} "
+                    f"est_time={estimated_seconds:.0f}s"
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Upload timed out. File may be too large for current network speed. "
+                           f"Estimated time: {estimated_seconds:.0f}s for {file_size // (1024*1024)} MB."
+                )
             except Exception as e:
-                logger.error(f"Upload failed for {file_name}: {e}")
+                logger.error(
+                    f"UPLOAD_FAILED file={file_name} size={file_size} "
+                    f"mime={mime_type} error={type(e).__name__} detail={e}"
+                )
                 raise
 
     def _extract_media(self, result: Message):

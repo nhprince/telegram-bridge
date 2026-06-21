@@ -20,7 +20,7 @@ from rate_limit import RateLimitMiddleware
 from logging_config import setup_logging
 
 from config import (
-    API_SECRET_KEY, ALLOWED_ORIGINS, MAX_FILE_SIZE,
+    API_SECRET_KEY, ALLOWED_ORIGINS, MAX_FILE_SIZE, UPLOAD_TIMEOUT, CHUNK_SIZE,
     BRIDGE_HOST, BRIDGE_PORT, CHANNEL_ID
 )
 from bridge import bridge
@@ -248,10 +248,12 @@ async def upload_file(
     file_data = await file.read()
     file_size = len(file_data)
 
+    max_mb = MAX_FILE_SIZE // (1024 * 1024)
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Max size: {MAX_FILE_SIZE // (1024*1024*1024)} GB"
+            detail=f"File too large ({file_size // (1024*1024)} MB). Max size: {max_mb} MB. "
+                   f"At current upload speed, {max_mb} MB takes ~{max_mb // 15} minutes."
         )
 
     if file_size == 0:
@@ -269,15 +271,28 @@ async def upload_file(
 
     target_channel = channel_id or CHANNEL_ID
 
-    result = await bridge.upload_file(
-        file_data=file_data,
-        file_name=file.filename or "unnamed",
-        mime_type=file.content_type or "application/octet-stream",
-        channel_id=target_channel,
-        app_id=app_id,
-        folder_id=folder_id,
-        description=description or None,
-    )
+    try:
+        result = await bridge.upload_file(
+            file_data=file_data,
+            file_name=file.filename or "unnamed",
+            mime_type=file.content_type or "application/octet-stream",
+            channel_id=target_channel,
+            app_id=app_id,
+            folder_id=folder_id,
+            description=description or None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"UPLOAD_FAILED app={app_id} file={file.filename} "
+            f"size={file_size} mime={file.content_type} "
+            f"error={type(e).__name__} detail={e}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Telegram upload failed: {type(e).__name__}"
+        )
 
     # Save to database
     save_upload(
@@ -633,3 +648,28 @@ if __name__ == "__main__":
         workers=1,
         log_level="info",
     )
+
+
+# ─── Upload Config (public) ───────────────────────────────────────────
+
+@app.get("/v1/config", tags=["System"])
+async def get_upload_config():
+    """
+    Get upload configuration — no auth needed.
+    Frontend uses this to show limits, estimated times, chunk size, etc.
+    """
+    max_mb = MAX_FILE_SIZE // (1024 * 1024)
+    return {
+        "success": True,
+        "max_file_size_bytes": MAX_FILE_SIZE,
+        "max_file_size_mb": max_mb,
+        "upload_timeout_seconds": UPLOAD_TIMEOUT,
+        "upload_timeout_minutes": UPLOAD_TIMEOUT // 60,
+        "estimated_upload_speed_mbps": 0.15,
+        "estimated_time_per_mb_seconds": 6.7,
+        "estimated_time_for_max_mb_minutes": int(max_mb * 6.7 / 60),
+        "chunk_size_bytes": CHUNK_SIZE,
+        "supported_methods": ["single", "chunked"],
+        "note": "Upload speed depends on Telegram MTProto connection. "
+                "Estimated 0.15 MB/s. A 500MB file takes ~55 minutes."
+    }

@@ -5,20 +5,20 @@ import multiprocessing
 import os
 
 # Server socket
-bind = "127.0.0.1:9000"  # Internal only — exposed via nginx/cf tunnel
+bind = "127.0.0.1:9000"
 backlog = 2048
 
-# Worker processes
-# For async FastAPI: use 1 worker with uvicorn (handles thousands of concurrent connections via async)
-# For high-CPU workloads: use (2 × num_cores) + 1 workers with threads
-workers = 1  # Single async worker handles thousands of concurrent requests
+# Worker processes — MUST be 1 because Pyrogram MTProto session is a single SQLite file
+# that cannot be shared between multiple processes. Async handles concurrency.
+workers = 1
 worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
-threads = 4  # Fallback for sync operations
+threads = 4
 
-# Timeouts
-timeout = 120  # 2 min max per request (uploads can take time)
-graceful_timeout = 30
+# Timeouts — 5400s (90 min) to support 500MB uploads at 0.15 MB/s
+# 500MB / 0.15 MB/s = 3333s = 55 min + 35 min overhead = 90 min
+timeout = 5400
+graceful_timeout = 60
 keepalive = 5
 
 # Logging
@@ -40,8 +40,8 @@ forwarded_allow_ips = "*"
 secure_scheme_headers = {"X-Forwarded-Proto": "https"}
 
 # Performance
-max_requests = 10000  # Restart workers after 10K requests (prevents memory leaks)
-max_requests_jitter = 1000  # Add randomness to prevent all workers restarting at once
+max_requests = 10000
+max_requests_jitter = 1000
 
 # Graceful restart
 restart = False
