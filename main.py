@@ -13,7 +13,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from rate_limit import RateLimitMiddleware
@@ -34,6 +34,9 @@ from cache import url_cache
 from webhooks import webhook_manager
 from quotas import init_quotas_table, check_quota, get_quota, set_quota
 from cleanup import cleanup_expired_files
+
+# MTProto raw types for streaming downloads
+from pyrogram import raw as pyrogram_raw
 
 logger = setup_logging("INFO")
 
@@ -304,6 +307,10 @@ async def upload_file(
         app_id=app_id,
         folder_id=result["folder_id"],
         description=result["description"],
+        media_id=result.get("media_id", 0),
+        access_hash=result.get("access_hash", 0),
+        file_reference=result.get("file_reference", b""),
+        dc_id=result.get("dc_id", 0),
     )
 
     # Generate download URL and cache it
@@ -517,20 +524,104 @@ async def download_file(
     app_id: str = Query(...),
     api_key: str = Depends(verify_api_key),
 ):
-    """Redirect to the direct Telegram download URL."""
+    """
+    Stream a file download from Telegram via MTProto.
+    Works for ALL file sizes (no Bot API 20MB limit).
+    Uses Pyrogram's get_file which streams directly from Telegram DCs.
+    Falls back to Bot API redirect for old files without access_hash.
+    """
     upload = get_upload(file_unique_id, app_id=app_id)
     if not upload:
         raise HTTPException(status_code=404, detail="File not found")
 
+    access_hash = upload.get("access_hash", 0) or 0
+    file_reference = upload.get("file_reference", b"") or b""
+    media_id = upload.get("media_id", 0) or 0
+    file_id_int = upload["file_id"]
+    file_name = upload["file_name"]
+    file_size = upload["file_size"]
+    mime_type = upload.get("mime_type", "application/octet-stream")
+    dc_id = upload.get("dc_id", 0) or 0
+
+    # Increment download count
     increment_download_count(file_unique_id)
 
-    # Try cache first
-    download_url = url_cache.get(file_unique_id)
-    if not download_url:
-        download_url = await bridge.get_download_url(upload["file_id"])
-        url_cache.set(file_unique_id, download_url)
+    if not access_hash or not media_id:
+        # Fallback for old uploads: try Bot API (works for files ≤20MB)
+        download_url = url_cache.get(file_unique_id)
+        if not download_url:
+            try:
+                download_url = await bridge.get_download_url(file_id_int)
+                if download_url:
+                    url_cache.set(file_unique_id, download_url)
+            except Exception:
+                download_url = ""
+        if download_url:
+            return RedirectResponse(url=download_url)
+        raise HTTPException(
+            status_code=404,
+            detail="Download metadata not available. Re-upload the file to enable downloads."
+        )
 
-    return RedirectResponse(url=download_url)
+    async def stream_generator():
+        """Stream file chunks from Telegram via raw MTProto upload.getFile."""
+        try:
+            # Build the InputDocumentFileLocation
+            loc = pyrogram_raw.types.InputDocumentFileLocation(
+                id=media_id,
+                access_hash=access_hash,
+                file_reference=file_reference,
+                thumb_size='',
+            )
+            # Determine offset limit: Telegram requires offsets to be divisible by 4096
+            # and max chunk size is 1MB (1048576 bytes) for non-premium
+            chunk_size = 1024 * 1024  # 1MB
+            offset = 0
+            while offset < file_size:
+                remaining = file_size - offset
+                limit = min(chunk_size, remaining)
+                # Telegram requires limit to be a power-of-2 multiple of 4096
+                # Round up to next power of 2 × 4096
+                limit_4k = (limit + 4095) // 4096
+                # Round up to next power of 2
+                power = 1
+                while power < limit_4k:
+                    power *= 2
+                limit = power * 4096
+                try:
+                    chunk = await bridge.client.invoke(
+                        pyrogram_raw.functions.upload.GetFile(
+                            location=loc,
+                            offset=offset,
+                            limit=limit,
+                        )
+                    )
+                    if hasattr(chunk, 'bytes') and chunk.bytes:
+                        # Trim to actual file size
+                        data = chunk.bytes
+                        if offset + len(data) > file_size:
+                            data = data[:file_size - offset]
+                        yield data
+                        offset += len(data)
+                    else:
+                        logger.error(f"Download: empty chunk at offset {offset}")
+                        break
+                except Exception as chunk_err:
+                    logger.error(f"Download chunk error at offset {offset}: {chunk_err}")
+                    break
+        except Exception as e:
+            logger.error(f"Download stream error for {file_unique_id}: {type(e).__name__}: {e}")
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "none",
+            "X-Request-ID": str(uuid.uuid4())[:12],
+        },
+    )
 
 
 # ─── Webhook Management ────────────────────────────────────────────────
@@ -678,3 +769,5 @@ async def get_upload_config():
         "note": "Upload speed depends on Telegram MTProto connection. "
                 "Estimated 0.15 MB/s. A 500MB file takes ~55 minutes."
     }
+
+

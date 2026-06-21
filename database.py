@@ -75,6 +75,27 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # ── v2.2: add access_hash + file_reference for MTProto downloads ──
+        try:
+            conn.execute("ALTER TABLE files ADD COLUMN media_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE files ADD COLUMN access_hash INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE files ADD COLUMN file_reference BLOB")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE files ADD COLUMN dc_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
         # ── Rename uploads → files if migrating from v1 ────────────────
         try:
             conn.execute("ALTER TABLE uploads RENAME TO files")
@@ -101,7 +122,8 @@ def get_connection():
 
 def save_upload(file_unique_id: str, file_id: str, file_name: str,
                file_size: int, mime_type: str, app_id: str,
-               folder_id: str = "root", description: str | None = None):
+               folder_id: str = "root", description: str | None = None,
+               media_id: int = 0, access_hash: int = 0, file_reference: bytes = b"", dc_id: int = 0):
     """Save upload metadata to database."""
     with get_connection() as conn:
         # Register app if not exists
@@ -113,10 +135,12 @@ def save_upload(file_unique_id: str, file_id: str, file_name: str,
         conn.execute(
             """INSERT OR REPLACE INTO files 
                (file_unique_id, file_id, file_name, file_size, mime_type, 
-                folder_id, app_id, description, uploaded_by, uploaded_at, is_deleted)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                folder_id, app_id, description, uploaded_by, uploaded_at, is_deleted,
+                media_id, access_hash, file_reference, dc_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
             (file_unique_id, file_id, file_name, file_size, mime_type,
-             folder_id, app_id, description, app_id, time.time())
+             folder_id, app_id, description, app_id, time.time(),
+             media_id, access_hash, file_reference, dc_id)
         )
 
 

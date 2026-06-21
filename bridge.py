@@ -15,6 +15,7 @@ pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
 pyrogram.utils.MIN_CHAT_ID = -2147483648
 
 from pyrogram import Client
+from pyrogram import raw as praw
 from pyrogram.types import Message
 from pyrogram.errors.exceptions.bad_request_400 import PhotoSaveFileInvalid
 from config import API_ID, API_HASH, BOT_TOKEN
@@ -142,9 +143,51 @@ class TelegramBridge:
 
                 file_obj = self._extract_media(result)
 
+                # Extract MTProto download metadata
+                # Pyrogram's high-level Document doesn't expose access_hash/dc_id.
+                # We use the raw channels.GetMessages API to get the full document metadata.
+                access_hash = 0
+                file_reference = b""
+                dc_id = 0
+                media_id = 0
+
+                if file_obj.file_id:
+                    try:
+                        peer = await self.client.resolve_peer(channel_id)
+                        # Retry up to 3 times — message may not be immediately available
+                        for attempt in range(3):
+                            raw_msgs = await self.client.invoke(
+                                praw.functions.channels.GetMessages(
+                                    channel=peer,
+                                    id=[praw.types.InputMessageID(id=result.id)],
+                                )
+                            )
+                            if raw_msgs and hasattr(raw_msgs, 'messages'):
+                                found = False
+                                for raw_msg in raw_msgs.messages:
+                                    if hasattr(raw_msg, 'media') and raw_msg.media:
+                                        media = raw_msg.media
+                                        if hasattr(media, 'document') and media.document:
+                                            doc = media.document
+                                            media_id = doc.id
+                                            access_hash = doc.access_hash
+                                            file_reference = doc.file_reference
+                                            dc_id = doc.dc_id
+                                            found = True
+                                            break
+                                if found:
+                                    break
+                            if attempt < 2:
+                                await asyncio.sleep(1)
+                        else:
+                            logger.warning(f"channels.GetMessages returned no document after 3 attempts")
+                    except Exception as e:
+                        logger.warning(f"Could not fetch raw message for access_hash: {type(e).__name__}: {e}")
+
                 logger.info(
                     f"UPLOAD_OK file={file_name} size={file_size} "
-                    f"file_id={file_obj.file_id} file_unique_id={file_obj.file_unique_id}"
+                    f"file_id={file_obj.file_id} file_unique_id={file_obj.file_unique_id} "
+                    f"media_id={media_id} access_hash={access_hash} dc_id={dc_id}"
                 )
 
                 return {
@@ -156,6 +199,10 @@ class TelegramBridge:
                     "app_id": app_id,
                     "folder_id": folder_id,
                     "description": description,
+                    "media_id": media_id,
+                    "access_hash": access_hash,
+                    "file_reference": file_reference,
+                    "dc_id": dc_id,
                 }
 
             except PhotoSaveFileInvalid as e:
