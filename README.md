@@ -222,8 +222,16 @@ Health check — no auth required.
 - **Channel:** Storage (ID: -1004360908345)
 - **VPS:** `40.82.136.197`, port 9000
 - **Bridge API:** `https://origin-api.nhprince.dpdns.org` (primary), `https://bridge-api.nhprince.dpdns.org` (fallback)
-- **Apps using it:** Prince Snaps (live at prince-snaps.pages.dev), BajarSodai (planned)
 - **API Key:** `prince_snaps_bridge_2026`
+
+### Apps Using the Bridge
+
+| App | `app_id` | D1 Database | Telegram Target | Storage Method | Status |
+|-----|----------|-------------|-----------------|----------------|--------|
+| **Prince Snaps** | `prince-snaps` | `prince-snaps-db` | Channel `-1004360908345` | MTProto Bridge | ✅ Live |
+| **InstaPrince** | N/A | `instaprince-db` | Admin's private chat | Bot API (direct) | ✅ Live |
+
+**Note:** InstaPrince does NOT use the bridge — it uses the Bot API directly. Only Prince Snaps uses the MTProto Bridge. Both apps share the same Telegram bot but target different destinations.
 
 ### URL Configuration
 
@@ -242,6 +250,18 @@ Health check — no auth required.
 1. Load photo list from CF Worker (D1 database)
 2. Display photos using `download_url` from bridge (Bot API, works for ≤20MB)
 3. For full download → use bridge `GET /v1/download/{file_id}` (MTProto, no size limit)
+
+### App Isolation
+
+Each app using the bridge is isolated via the `app_id` field:
+
+- Files uploaded with `app_id=prince-snaps` are only visible to Prince Snaps
+- The `files` table in `bridge.db` stores `app_id` with every upload
+- `GET /v1/files` filters by `app_id` — apps cannot see each other's files
+- Each app has its own D1 database on Cloudflare
+- Each app targets a different Telegram destination (channel vs private chat)
+
+**No data leakage between apps.**
 
 ## Deployment
 
