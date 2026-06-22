@@ -216,6 +216,13 @@ Health check — no auth required.
 | `ALLOWED_ORIGINS` | No | CORS origins | * |
 | `DATABASE_PATH` | No | SQLite database path | bridge.db |
 
+## Current Deployment
+
+- **Bot:** @NhStorageapiprincebot (ID: 8932401901)
+- **Channel:** Storage (ID: -1004360908345)
+- **VPS:** Running on port 9000
+- **Apps using it:** Prince Snaps, BajarSodai (planned)
+
 ## Deployment
 
 ### Systemd Service (Auto-restart on Reboot)
@@ -228,73 +235,72 @@ sudo systemctl start telegram-bridge
 sudo systemctl status telegram-bridge
 ```
 
+### Nginx + Cloudflare SSL
+
+The bridge runs behind nginx with Cloudflare Full (Strict) SSL:
+
+- `bridge-api.nhprince.dpdns.org` — Cloudflare proxied (orange cloud), used for uploads ≤100MB and API calls
+- `origin-api.nhprince.dpdns.org` — Grey cloud (no Cloudflare proxy), used for large uploads (>100MB) and downloads
+
+**Why two domains?** Cloudflare free plan has a 100MB upload limit. Large files bypass it via the grey cloud subdomain. Downloads also use the grey cloud for maximum speed (no Cloudflare proxy overhead).
+
 ### Firewall
 
 ```bash
-# Only allow Cloudflare Workers to reach port 9000
+# Only allow Cloudflare IPs to reach port 9000
 ufw allow from 173.245.48.0/20 to any port 9000
-ufw allow from 103.21.244.0/22 to any port 9000
 # ... (all Cloudflare IP ranges)
 ```
 
-## Using from Cloudflare Workers
+## Known Issues & Fixes
 
-```typescript
-const formData = new FormData();
-formData.append('file', fileBlob);
-formData.append('app_id', 'bajar-sodai');
+### Cloudflare 100MB Upload Limit
 
-const response = await fetch('http://your-vps-ip:9000/upload', {
-  method: 'POST',
-  headers: { 'X-API-Key': 'your-secret-key' },
-  body: formData,
-});
+**Problem:** Cloudflare free plan has a hard 100MB upload limit at the CDN edge. Files >100MB get HTTP 413.
 
-const result = await response.json();
-// Store result.file_id and result.file_unique_id in D1
-// Use result.download_url for displaying the file
-```
+**Solution:** Use `origin-api.nhprince.dpdns.org` (grey cloud, proxied:false) for uploads >100MB. This bypasses Cloudflare entirely and goes directly to the VPS.
 
-## Multi-App Architecture
+### Bot API getFile ~20MB Limit
 
-One bridge serves all your applications:
+**Problem:** The Telegram Bot API `getFile` endpoint returns "Bad Request: file is too big" for files >20MB.
 
-```
-                    ┌─ Prince Snaps (app_id: prince-snaps)
-                    │
-Telegram Bridge ────┼─ BajarSodai (app_id: bajar-sodai)
-                    │
-                    └─ Future App (app_id: anything)
-```
+**Solution:** The bridge handles this gracefully by returning an empty `download_url`. For actual file downloads, use the `GET /v1/download/{file_unique_id}` endpoint which streams via MTProto (no size limit).
 
-Each app uses a different `app_id` for tracking. You can optionally use different `channel_id` per app.
+### Telegram MTProto upload.getFile Limit Requirement
 
-## Troubleshooting
+**Problem:** When streaming downloads via raw MTProto `upload.getFile`, the `limit` parameter must be a **power-of-2 multiple of 4096** (i.e., 1×4096, 2×4096, 4×4096, 8×4096, 16×4096, 32×4096, 64×4096, 128×4096, 256×4096). Non-power-of-2 multiples like 3×4096, 5×4096, 23×4096 FAIL with `LimitInvalid`.
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| `Peer id invalid: -100XXXX` | Pyrogram channel ID limit | Apply the `MIN_CHANNEL_ID` patch (automatic in this repo) |
-| `ChatWriteForbidden` | Bot lacks Post Messages permission | Grant the bot admin rights with Post Messages in the channel |
-| `FLOOD_WAIT_420` | Too many auth attempts | Delete `.session` files, wait ~15 min, restart |
-| `AccessTokenInvalid` | Wrong bot token | Double-check token from @BotFather |
-| `ModuleNotFoundError: aiohttp` | Missing dependency | `pip install aiohttp` |
-| `'_io.BytesIO' object has no attribute 'name'` | Missing .name on BytesIO | Fixed in `_make_file()` helper |
-| `CHANNEL_INVALID` | Bot not in channel | Add bot as admin, send a message to the channel |
+**Solution:** The download endpoint rounds up the chunk size to the next power-of-2 × 4096. The `offset + limit` can exceed the file size — Telegram returns fewer bytes than requested for the last chunk.
 
-## Security Notes
+### access_hash Not in send_document Response
 
-1. **Bot token never exposed** — download URLs are generated server-side
-2. **API Key authentication** — all endpoints except `/health` require `X-API-Key`
-3. **No disk storage** — files are streamed directly to Telegram
-4. **Session file** — contains Telegram session data; keep it secure (in `.gitignore`)
-5. **Firewall** — restrict port 9000 to Cloudflare IPs only
+**Problem:** Pyrogram's high-level `send_document()` returns a `Message` object, but the `Document` inside it doesn't include `access_hash` or `dc_id` — these are needed for MTProto downloads.
 
-## Current Deployment
+**Solution:** After upload, call the raw `channels.GetMessages` API to get the full document metadata including `access_hash`, `dc_id`, `file_reference`, and numeric `media_id`. Retry up to 3 times with 1s delay (message may not be immediately available).
 
-- **Bot:** @NhStorageapiprincebot (ID: 8932401901)
-- **Channel:** Storage (ID: -1004360908345)
-- **VPS:** Running on port 9000
-- **Apps using it:** Prince Snaps, BajarSodai (planned)
+### file_id vs media_id
+
+**Problem:** The Telegram `file_id` string (e.g., `BQACAgUAAyEGAAMBA-4uOQAD...`) is NOT the same as the numeric MTProto `media_id` (e.g., `6178968208062554629`). `InputDocumentFileLocation.id` requires the numeric ID.
+
+**Solution:** Store both `file_id` (string) and `media_id` (integer) in the database.
+
+### Binary Fields in JSON Response
+
+**Problem:** The `file_reference` column in SQLite is a BLOB (binary data). When FastAPI tries to serialize it to JSON, it fails with `UnicodeDecodeError`.
+
+**Solution:** Strip `file_reference`, `access_hash`, `media_id`, `dc_id` from list responses. These are internal fields not needed by the frontend.
+
+### CORS on Error Responses
+
+**Problem:** FastAPI's CORS middleware only adds headers to successful responses. Error responses (422, 429, 500) from early returns (rate limiter, auth) bypass CORS.
+
+**Solution:** Added global exception handlers for `HTTPException`, `RequestValidationError`, and `Exception` that include CORS headers. Also added CORS headers to the rate limiter's 429 responses.
+
+### Large File Download Browser Freeze
+
+**Problem:** Using `fetch()` → `res.blob()` → `URL.createObjectURL()` loads the entire file into browser memory. For 170MB+ files, this freezes the browser.
+
+**Solution:** Downloads use `origin-api.nhprince.dpdns.org` (grey cloud, no Cloudflare) for direct high-speed streaming. The browser's native download mechanism handles the file as a stream. Progress is logged every 5%.
 
 ## License
 
