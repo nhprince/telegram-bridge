@@ -168,6 +168,7 @@ class ApiResponse(BaseModel):
 
 class UploadResponse(BaseModel):
     success: bool
+    file_id: str
     file_unique_id: str
     file_name: str
     file_size: int
@@ -383,6 +384,7 @@ async def upload_file(
 
     return UploadResponse(
         success=True,
+        file_id=result["file_id"],
         file_unique_id=result["file_unique_id"],
         file_name=result["file_name"],
         file_size=result["file_size"],
