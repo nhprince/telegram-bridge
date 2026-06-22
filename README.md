@@ -358,6 +358,40 @@ The bridge-test.html and Prince Snaps app both use `origin-api` as primary with 
 
 All downloads use `origin-api.nhprince.dpdns.org` (grey cloud, no Cloudflare) for direct high-speed streaming — measured at 8+ MB/s.
 
+### Upload Fails at 100% — "Bad Request" After Bridge Upload (Prince Snaps)
+
+**Problem:** After uploading a file to the bridge (progress reaches 100%), the frontend throws a "Bad Request" error. The file is successfully uploaded to Telegram, but the metadata save to D1 fails.
+
+**Root Cause:** The `UploadResponse` Pydantic model in `main.py` was missing the `file_id` field. The bridge's internal `upload_file()` function returns `file_id`, but the API response model only included `file_unique_id`. The frontend reads `bridgeResult.file_id` which was `undefined`, then sends it to the Worker's D1 insert. The Worker checks `if (!body.file_id || !body.file_unique_id)` — since `file_id` was `undefined` (falsy), it returns HTTP 400 "Missing bridge upload data".
+
+**Fix:** Added `file_id: str` to the `UploadResponse` model and included `file_id=result["file_id"]` in the return statement of the `/v1/upload` endpoint.
+
+**Files changed:** `main.py` — `UploadResponse` class and `return UploadResponse(...)` in `upload_file()` endpoint.
+
+### Venv Corruption After Python Upgrade
+
+**Problem:** After `unattended-upgrades` upgrades Python (e.g., 3.11 → 3.12), the bridge's virtualenv breaks. The `python` binary inside `venv/bin/` becomes a symlink to the old Python version which no longer exists. Systemd fails with "No such file or directory" even though `venv/bin/` looks intact.
+
+**Symptoms:** `systemctl status telegram-bridge` shows `Failed to execute .../venv/bin/gunicorn: No such file or directory`. Running `venv/bin/python --version` gives "No such file or directory".
+
+**Diagnosis:** `ls -la venv/bin/python*` shows broken symlinks pointing to the old Python version.
+
+**Solution:** Recreate the venv from scratch:
+```bash
+cd ~/telegram-bridge
+rm -rf venv
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install gunicorn  # if using gunicorn
+sudo systemctl restart telegram-bridge
+```
+
+**Note:** If using `uvicorn` instead of `gunicorn` (installed by default with `pip install uvicorn`), you don't need a separate gunicorn install. Update the systemd service to use:
+```
+ExecStart=/home/nhprince/telegram-bridge/venv/bin/uvicorn main:app --host 0.0.0.0 --port 9000 --workers 1 --timeout-keep-alive 5400 --log-level warning
+```
+
 ## Increasing the File Size Limit (Future Reference)
 
 > **Current limit: 500MB.** This can be increased when you get a more powerful VPS. Everything below documents exactly what to change and why.
@@ -441,6 +475,16 @@ For comfortable 2GB file support:
 - **Disk:** 40GB+ SSD (for temp buffering during upload)
 - **Bandwidth:** 1TB+ monthly (large file transfers eat bandwidth)
 - **CPU:** 2 vCPUs (MTProto encryption is CPU-bound)
+
+## VPS Cleanup (2026-06-22)
+
+The VPS was cleaned up to free disk space. All project repos were synced to GitHub and deleted from local disk. Only `telegram-bridge`, `prince-snaps`, and `instaprince` remain.
+
+**Disk before:** 99% full (328M free)  
+**Disk after:** 51% full (14G free)
+
+Full cleanup log: `/home/nhprince/VPS-CLEANUP-LOG.md` (on VPS)  
+All deleted repos can be restored with `git clone` from GitHub.
 
 ## License
 
