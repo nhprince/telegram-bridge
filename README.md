@@ -358,6 +358,90 @@ The bridge-test.html and Prince Snaps app both use `origin-api` as primary with 
 
 All downloads use `origin-api.nhprince.dpdns.org` (grey cloud, no Cloudflare) for direct high-speed streaming — measured at 8+ MB/s.
 
+## Increasing the File Size Limit (Future Reference)
+
+> **Current limit: 500MB.** This can be increased when you get a more powerful VPS. Everything below documents exactly what to change and why.
+
+### Current Limits at Every Layer
+
+| Layer | Current Setting | Hard Limit | Notes |
+|-------|----------------|------------|-------|
+| **Telegram MTProto** | 500MB | **2GB** (free) / 4GB (Premium) | Telegram server-side limit |
+| **FastAPI `file.read()`** | Loads entire file into RAM | **~300MB safe** (VPS has 842MB RAM, 293MB free) | **Biggest blocker** — see below |
+| **Gunicorn timeout** | 5400s (90 min) | Configurable | 500MB takes ~55 min at 0.15 MB/s |
+| **nginx `client_max_body_size`** (bridge-api) | 500M | Configurable | Must match or exceed MAX_FILE_SIZE |
+| **nginx `client_max_body_size`** (origin-api) | 2G | Configurable | Already set to 2GB |
+| **VPS disk space** | 330MB free | 29GB total | Temp buffering needs free space |
+| **Cloudflare free plan** | 100MB upload | 100MB | Already bypassed via grey cloud origin-api |
+
+### What Needs to Change for 1GB
+
+1. **`config.py`** — Change `MAX_FILE_SIZE` to `1073741824` (1024³ = 1GB)
+2. **`bridge-api` nginx vhost** — Change `client_max_body_size` to `1024M`
+3. **`gunicorn.conf.py`** — Change `timeout` to `7200` (2 hours)
+4. **`main.py`** — **CRITICAL:** Replace `file_data = await file.read()` with streaming upload (see below)
+5. **VPS disk** — Free up at least 1-2GB for temp buffering
+
+### What Needs to Change for 2GB (Maximum)
+
+All of the above, plus:
+- Gunicorn `timeout` → `10800` (3 hours) — 2GB at 0.15 MB/s ≈ 220 min
+- VPS disk — At least 3-4GB free for temp buffering
+- **Streaming upload is MANDATORY** at this size
+
+### The Critical Fix: Streaming Upload
+
+**Current code in `main.py` (line ~297):**
+```python
+file_data = await file.read()  # Loads ENTIRE file into RAM
+```
+
+This loads the complete file into Python memory before uploading. On the current VPS (842MB RAM, ~293MB available):
+- 500MB file → works (barely)
+- 1GB file → **OOM crash**
+- 2GB file → **definitely crashes**
+
+**Required fix — Stream to temp file instead:**
+```python
+import tempfile, aiofiles
+
+# Instead of: file_data = await file.read()
+# Stream to disk:
+with tempfile.NamedTemporaryFile(delete=False, dir="/tmp/telegram-bridge-uploads") as tmp:
+    async for chunk in file.file:
+        tmp.write(chunk)
+    tmp_path = tmp.name
+
+# Then pass file path to Pyrogram instead of bytes
+# Modify bridge.upload_file() to accept file_path parameter
+# Pyrogram can stream from file path directly
+```
+
+This way only a small buffer is in RAM at any time, regardless of file size.
+
+### Step-by-Step Upgrade Checklist
+
+When you get a new VPS:
+
+1. [ ] Set `MAX_FILE_SIZE` in `config.py` to desired limit
+2. [ ] Update `client_max_body_size` in `bridge-api` nginx config
+3. [ ] Update gunicorn `timeout` in `gunicorn.conf.py`
+4. [ ] **Implement streaming upload** in `main.py` (replace `file.read()` with temp file streaming)
+5. [ ] **Update `bridge.py`** `upload_file()` to accept file path instead of bytes
+6. [ ] Ensure VPS has enough free disk (at least 2× max file size for temp space)
+7. [ ] Ensure VPS has enough RAM (at least 2GB recommended for 1GB+ files)
+8. [ ] Restart nginx: `sudo systemctl reload nginx`
+9. [ ] Restart bridge: `sudo systemctl restart telegram-bridge`
+10. [ ] Test with a file larger than 500MB
+
+### New VPS Recommendations
+
+For comfortable 2GB file support:
+- **RAM:** 4GB+ (so streaming buffers don't cause OOM)
+- **Disk:** 40GB+ SSD (for temp buffering during upload)
+- **Bandwidth:** 1TB+ monthly (large file transfers eat bandwidth)
+- **CPU:** 2 vCPUs (MTProto encryption is CPU-bound)
+
 ## License
 
 MIT
