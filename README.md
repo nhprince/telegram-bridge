@@ -306,6 +306,18 @@ ufw allow from 173.245.48.0/20 to any port 9000
 
 All downloads use `origin-api.nhprince.dpdns.org` (grey cloud, no Cloudflare) for direct high-speed streaming — measured at 8+ MB/s.
 
+### Upload: Cloudflare 100MB Limit Bypass
+
+**Problem:** Cloudflare free plan has a hard 100MB upload limit at the CDN edge. Files >100MB sent through `bridge-api.nhprince.dpdns.org` (Cloudflare proxied) get HTTP 413.
+
+**Solution:** For files >100MB, use `origin-api.nhprince.dpdns.org` (grey cloud, DNS-only) which connects directly to the VPS origin, bypassing Cloudflare entirely. The bridge-test.html automatically switches based on file size.
+
+### index.html Overwrite
+
+**Problem:** The `out/index.html` was accidentally overwritten by `bridge-test.html` during manual copy operations. This caused the deployed site to show the test page instead of the actual Prince Snaps app.
+
+**Solution:** Always rebuild with `vite build` (which uses `emptyOutDir: true`). The `bridge-test.html` should be copied to `out/` as a separate file, never as `index.html`.
+
 ## License
 
 MIT
