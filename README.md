@@ -220,8 +220,28 @@ Health check — no auth required.
 
 - **Bot:** @NhStorageapiprincebot (ID: 8932401901)
 - **Channel:** Storage (ID: -1004360908345)
-- **VPS:** Running on port 9000
-- **Apps using it:** Prince Snaps, BajarSodai (planned)
+- **VPS:** `40.82.136.197`, port 9000
+- **Bridge API:** `https://origin-api.nhprince.dpdns.org` (primary), `https://bridge-api.nhprince.dpdns.org` (fallback)
+- **Apps using it:** Prince Snaps (live at prince-snaps.pages.dev), BajarSodai (planned)
+- **API Key:** `prince_snaps_bridge_2026`
+
+### URL Configuration
+
+| Domain | Cloudflare | Use Case |
+|--------|-----------|----------|
+| `origin-api.nhprince.dpdns.org` | Grey cloud (DNS-only) | Primary for all uploads and downloads |
+| `bridge-api.nhprince.dpdns.org` | Orange cloud (proxied) | Fallback if origin-api unreachable |
+
+**Why origin-api as primary?** Cloudflare's CDN is sometimes unreachable from Bangladesh ISPs. The grey cloud domain connects directly to the VPS.
+
+**Prince Snaps upload flow:**
+1. Try `origin-api.nhprince.dpdns.org/v1/upload`
+2. If network error → fallback to `bridge-api.nhprince.dpdns.org/v1/upload`
+
+**Prince Snaps download flow:**
+1. Load photo list from CF Worker (D1 database)
+2. Display photos using `download_url` from bridge (Bot API, works for ≤20MB)
+3. For full download → use bridge `GET /v1/download/{file_id}` (MTProto, no size limit)
 
 ## Deployment
 
@@ -253,6 +273,36 @@ ufw allow from 173.245.48.0/20 to any port 9000
 ```
 
 ## Known Issues & Fixes
+
+### Cloudflare Connectivity from Bangladesh
+
+**Problem:** Some ISPs in Bangladesh intermittently block or have routing issues with Cloudflare CDN IPs. Users get "Could not connect to bridge-api.nhprince.dpdns.org" errors when uploading or downloading.
+
+**Root Cause:** `bridge-api.nhprince.dpdns.org` routes through Cloudflare's CDN (IPs: 172.67.x.x, 104.21.x.x). When the ISP blocks Cloudflare, all API calls fail.
+
+**Solution:** The bridge provides two domains:
+- **`origin-api.nhprince.dpdns.org`** — Grey cloud (DNS-only), resolves directly to VPS IP (`40.82.136.197`). No Cloudflare. Use this as primary.
+- **`bridge-api.nhprince.dpdns.org`** — Cloudflare proxied (orange cloud). Used as fallback if origin-api is unreachable.
+
+The bridge-test.html and Prince Snaps app both use `origin-api` as primary with automatic fallback to `bridge-api`.
+
+**User-side fixes if still blocked:**
+1. Switch between WiFi and mobile data
+2. Use a VPN (any free VPN works)
+3. Try a different browser
+4. Clear browser cache and DNS cache
+
+### Upload: Cloudflare 100MB Limit Bypass
+
+**Problem:** Cloudflare free plan has a hard 100MB upload limit at the CDN edge. Files >100MB sent through `bridge-api.nhprince.dpdns.org` get HTTP 413.
+
+**Solution:** For files >100MB, use `origin-api.nhprince.dpdns.org` (grey cloud, DNS-only) which connects directly to the VPS origin, bypassing Cloudflare entirely. The bridge-test.html automatically switches based on file size.
+
+### index.html Overwrite
+
+**Problem:** The `out/index.html` was accidentally overwritten by `bridge-test.html` during manual copy operations. This caused the deployed site to show the test page instead of the actual Prince Snaps app.
+
+**Solution:** Always rebuild with `vite build` (which uses `emptyOutDir: true`). The `bridge-test.html` should be copied to `out/` as a separate file, never as `index.html`.
 
 ### Cloudflare 100MB Upload Limit
 
@@ -300,9 +350,11 @@ ufw allow from 173.245.48.0/20 to any port 9000
 
 **Problem:** Using `fetch()` → `res.blob()` → `URL.createObjectURL()` loads the entire file into browser memory. For 170MB+ files on low-end devices, this freezes the browser and triggers "unresponsive" warnings.
 
-**Solution:** Two-tier approach:
+**Solution:** Two-tier approach in `bridge-test.html`:
 1. **Primary (Chrome/Edge):** Uses the File System Access API (`showSaveFilePicker` + `createWritable`) to stream chunks directly to disk as they arrive. Memory usage stays flat at ~1MB regardless of file size.
-2. **Fallback (Firefox/Safari/mobile):** Accumulates chunks in memory but yields to the browser event loop every 5MB via `setTimeout(r, 0)`. This prevents the "unresponsive" warning and keeps the UI smooth on low-end devices.
+2. **Fallback (Firefox/Safari/mobile):** Accumulates chunks in a blob and triggers download via `<a download>`. Works on all browsers but uses more memory for large files.
+
+**Important:** Downloads use `fetch()` with the `X-API-Key` header — the old `<a href="download_url">` approach does NOT send the API key and will be rejected by the bridge.
 
 All downloads use `origin-api.nhprince.dpdns.org` (grey cloud, no Cloudflare) for direct high-speed streaming — measured at 8+ MB/s.
 
