@@ -82,10 +82,8 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-# Rate limiting — 60 req/min general, 10 uploads/min (added BEFORE CORS so CORS runs first)
-app.add_middleware(RateLimitMiddleware, requests_per_minute=60, upload_rpm=10)
-
 # CORS — allow any origin (public API) — MUST be outermost to handle OPTIONS preflight
+# Added BEFORE other middleware so it wraps everything and intercepts OPTIONS first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -94,6 +92,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
 )
+
+# Rate limiting — 60 req/min general, 10 uploads/min
+app.add_middleware(RateLimitMiddleware, requests_per_minute=60, upload_rpm=10)
 
 
 # ─── Global Exception Handler (ensures CORS on all error responses) ─────

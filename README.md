@@ -509,3 +509,531 @@ All deleted repos can be restored with `git clone` from GitHub.
 ## License
 
 MIT
+
+---
+
+## Appendix A: CORS Fix (2026-06-25)
+
+### Problem
+
+Cross-origin `fetch()` / `XMLHttpRequest` from browser to the bridge API was blocked:
+
+```
+Access to XMLHttpRequest at 'https://origin-api.nhprince.dpdns.org/v1/stats'
+from origin 'https://bridge-diag.pages.dev' has been blocked by CORS policy:
+Response to preflight doesn't pass access control check: No
+'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+Despite everything working from `curl` and localhost, the browser refused the request.
+
+### Investigation (3 hours, 5 different failed approaches)
+
+**Attempt 1**: Adding `add_header 'Access-Control-Allow-Origin' '*'` at the nginx `server` level.
+- **Failed**: `add_header` is forbidden inside `if` blocks at server level in nginx.
+
+**Attempt 2**: Adding `add_header ... always` inside `location` blocks + letting FastAPI CORSMiddleware handle it.
+- **Failed**: Through Cloudflare (orange cloud), this created **DUPLICATE CORS headers** — both FastAPI and nginx added `access-control-allow-origin`. Browsers reject responses with duplicate CORS headers.
+
+**Attempt 3**: Handling OPTIONS preflight by returning 204 at nginx using `add_header` inside `location` + `if` blocks.
+- **Partially worked**: This actually works (`add_header` IS allowed inside `location` + `if`, just NOT at server level). But the duplicate headers issue remained for bridge-api through Cloudflare.
+
+**Attempt 4**: Removing FastAPI CORSMiddleware entirely, handling all CORS in nginx.
+- **Failed**: Couldn't reliably handle OPTIONS for POST-only routes (`/v1/upload`) without duplicating headers on GET routes.
+
+**Attempt 5** (final): Let FastAPI handle CORS via CORSMiddleware (ordered FIRST), add nginx-level OPTIONS handling ONLY for `/v1/upload` (POST-only route) using `location` + `if` block.
+
+### Root Causes (3 issues, all had to be fixed)
+
+**Issue 1: FastAPI middleware ordering**
+
+In Starlette/FastAPI, `add_middleware` prepends to the stack. The FIRST middleware added becomes the outermost wrapper. CORSMiddleware must be added BEFORE any other middleware, or OPTIONS preflight gets intercepted by rate limiting or auth before CORS handles it.
+
+```python
+# ✅ CORRECT — CORSMiddleware is outermost, intercepts OPTIONS first
+app.add_middleware(CORSMiddleware, allow_origins=["*"], ...)
+app.add_middleware(RateLimitMiddleware, ...)
+
+# ❌ WRONG — RateLimitMiddleware runs first, blocks OPTIONS with 429
+app.add_middleware(RateLimitMiddleware, ...)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], ...)
+```
+
+**Issue 2: CORS duplication through Cloudflare proxy**
+
+When using orange cloud (proxied), Cloudflare passes through ALL origin headers. If nginx ALSO adds CORS headers via `add_header`, the browser receives DUPLICATE headers and rejects the preflight:
+```
+access-control-allow-origin: https://bridge-diag.pages.dev    ← from FastAPI
+Access-Control-Allow-Origin: *                                 ← from nginx
+```
+
+**Fix**: Never add CORS headers at nginx level. Let FastAPI CORSMiddleware be the single source of truth.
+
+**Issue 3: OPTIONS preflight on POST-only routes**
+
+FastAPI routes declared with `@app.post("/v1/upload")` do not respond to OPTIONS unless CORSMiddleware intercepts it BEFORE route matching. But even with CORSMiddleware working, the route-specific middleware stack doesn't include an OPTIONS handler. The solution is to handle OPTIONS directly in nginx for that specific route.
+
+### Fix Applied
+
+**`main.py`** — Ensure CORSMiddleware is FIRST middleware:
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
+)
+# app.add_middleware(RateLimitMiddleware, ...) goes AFTER, not before
+```
+
+**`origin-api.nhprince.dpdns.org.conf`** and **`bridge-api.nhprince.dpdns.org.conf`** — Handle OPTIONS for `/v1/upload` in nginx location:
+```nginx
+location /v1/upload {
+    # Handle OPTIONS preflight directly — return 204 with CORS headers
+    if ($request_method = OPTIONS) {
+        add_header 'Access-Control-Allow-Origin' '*' always;
+        add_header 'Access-Control-Allow-Methods' 'POST, OPTIONS' always;
+        add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type' always;
+        add_header 'Access-Control-Max-Age' 86400 always;
+        return 204;
+    }
+
+    # Everything else → proxy to FastAPI
+    client_body_timeout 5400s;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_pass http://telegram_bridge;
+    proxy_set_header Host $host;
+}
+```
+
+**✅ WHY THIS WORKS**: `add_header` inside `location` + `if` IS allowed in nginx (unlike inside `server` + `if`). This returns 204 with CORS headers for the preflight, while proxying the actual POST to FastAPI. Since this only handles OPTIONS (not all responses), there are no duplicate headers.
+
+### Nginx `add_header` Rules to Remember
+
+| Location | `add_header` allowed? | Notes |
+|----------|----------------------|-------|
+| `server` block (directly) | ✅ Yes | For non-conditional headers |
+| `server` block inside `if` | ❌ **No** | nginx forbids this |
+| `location` block | ✅ Yes | Most common placement |
+| `location` block inside `if` | ✅ Yes | Required for conditional CORS |
+
+### Verification
+
+After applying the fix:
+```bash
+# Test OPTIONS preflight through nginx
+curl -X OPTIONS \
+  -H "Origin: https://bridge-diag.pages.dev" \
+  -H "Access-Control-Request-Method: POST" \
+  "https://origin-api.nhprince.dpdns.org/v1/upload" -v
+
+# Expected: 204 No Content with headers:
+# Access-Control-Allow-Origin: *
+# Access-Control-Allow-Methods: POST, OPTIONS
+# Access-Control-Allow-Headers: X-API-Key, Content-Type
+```
+
+### Test Page
+
+Updated `bridge-diag` test page uses `XMLHttpRequest` instead of `fetch()` for cross-origin requests — more reliable across network conditions and doesn't trigger ISP interception patterns as.
+
+Deployed to: `https://bridge-diag.pages.dev`
+
+---
+
+## Appendix B: Complete Rebuild Guide (A-Z From Scratch)
+
+> **Use this if you lose access to the VPS or need to rebuild everything.** This is the legitimate step-by-step process.
+
+### Prerequisites
+
+- A VPS with at least 2GB RAM and 20GB disk (Ubuntu 22.04+ recommended)
+- A domain on Cloudflare (free DDNS or any domain)
+- Telegram bot token from [@BotFather](https://t.me/botfather)
+- Telegram API credentials from [my.telegram.org](https://my.telegram.org/apps)
+- A private Telegram channel (the storage destination)
+
+### Phase 1: Server Setup
+
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install all dependencies
+sudo apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx
+```
+
+### Phase 2: Application Code
+
+```bash
+# Clone or create the project
+cd ~
+git clone https://github.com/nhprince/telegram-bridge.git  # OR create from scratch
+cd telegram-bridge
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**`requirements.txt`**:
+```
+pyrogram==2.0.106
+tgcrypto
+fastapi
+uvicorn[standard]
+python-dotenv
+aiohttp
+aiofiles
+```
+
+### Phase 3: Configuration
+
+Create `.env`:
+```bash
+cat > .env << 'EOF'
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=abc123def...
+BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHANNEL_ID=-1004360908345
+BRIDGE_HOST=0.0.0.0
+BRIDGE_PORT=9000
+API_SECRET_KEY=your-secret-key-here
+ALLOWED_ORIGINS=*
+DATABASE_PATH=bridge.db
+EOF
+chmod 600 .env
+```
+
+Verify config loads:
+```bash
+source venv/bin/activate
+python -c "from config import API_SECRET_KEY; print('Config OK:', bool(API_SECRET_KEY))"
+```
+
+### Phase 4: Python Path Fix (Pyrogram Channel ID Bug)
+
+If your Telegram channel ID is newer (e.g., `-1004360908345`), Pyrogram 2.0.106 may crash with `ValueError: Peer id invalid`. Fix this at the TOP of `bridge.py` before any Pyrogram imports:
+
+```python
+import pyrogram.utils
+pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
+pyrogram.utils.MIN_CHAT_ID = -2147483648
+```
+
+### Phase 5: Test the Application
+
+```bash
+source venv/bin/activate
+python main.py
+# Should start on port 9000
+# Test in another terminal:
+curl http://127.0.0.1:9000/health
+```
+
+### Phase 6: Systemd Service
+
+```bash
+sudo tee /etc/systemd/system/telegram-bridge.service << 'EOF'
+[Unit]
+Description=Telegram Bridge API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/telegram-bridge
+ExecStartPre=/usr/bin/mkdir -p /var/log/telegram-bridge /tmp/telegram-bridge-uploads
+ExecStart=/root/telegram-bridge/venv/bin/uvicorn main:app --host 0.0.0.0 --port 9000 --workers 1 --timeout-keep-alive 5400 --log-level warning
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable telegram-bridge
+sudo systemctl start telegram-bridge
+
+# Verify it's running
+sudo systemctl status telegram-bridge
+# Test through systemd service
+curl http://127.0.0.1:9000/health
+```
+
+### Phase 7: SSL Certificates
+
+```bash
+# Create webroot for ACME challenge
+sudo mkdir -p /var/www/certbot
+
+# Get SSL certificates for both domains
+sudo certbot --nginx -d origin-api.YOURDOMAIN -d bridge-api.YOURDOMAIN
+
+# Test auto-renewal
+sudo certbot renew --dry-run
+```
+
+### Phase 8: Nginx Configuration
+
+**Step 8a**: Create the upstream block at `/etc/nginx/conf.d/bridge-upstream.conf`:
+```bash
+sudo tee /etc/nginx/conf.d/bridge-upstream.conf << 'EOF'
+upstream telegram_bridge {
+    server 127.0.0.1:9000;
+    keepalive 32;
+}
+EOF
+```
+
+**Step 8b**: Create the **origin-api** domain (grey cloud, direct).
+
+⚠️ Replace `origin-api.YOURDOMAIN` and `YOUR_VPS_IP` with actual values.
+
+```bash
+sudo tee /etc/nginx/conf.d/origin-api.YOURDOMAIN.conf << 'NGINX'
+# HTTP → HTTPS redirect
+server {
+    listen 80;
+    server_name origin-api.YOURDOMAIN;
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+# HTTPS — Grey Cloud (direct to VPS)
+server {
+    listen 443 ssl http2;
+    server_name origin-api.YOURDOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/origin-api.YOURDOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/origin-api.YOURDOMAIN/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+
+    client_max_body_size 500M;
+    client_body_timeout 5400s;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 5400s;
+    proxy_read_timeout 5400s;
+
+    gzip on;
+    gzip_min_length 1000;
+    gzip_types application/json text/plain;
+
+    # POST-only routes need explicit OPTIONS handling
+    # (location + if allows add_header, server + if does NOT)
+    location /v1/upload {
+        if ($request_method = OPTIONS) {
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header 'Access-Control-Allow-Methods' 'POST, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type' always;
+            add_header 'Access-Control-Max-Age' 86400 always;
+            return 204;
+        }
+
+        client_body_timeout 5400s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass http://telegram_bridge;
+        proxy_set_header Host $host;
+    }
+
+    # All other routes → FastAPI (CORSMiddleware handles CORS)
+    location / {
+        proxy_pass http://telegram_bridge;
+        proxy_set_header Host $host;
+    }
+
+    location /docs { proxy_pass http://telegram_bridge; }
+    location = /openapi.json { proxy_pass http://telegram_bridge; }
+    location ~ /\\. { deny all; }
+}
+NGINX
+```
+
+**Step 8c**: Create the **bridge-api** domain (orange cloud, proxied through CF).
+Replace `bridge-api.YOURDOMAIN`:
+
+```bash
+sudo tee /etc/nginx/conf.d/bridge-api.YOURDOMAIN.conf << 'NGINX'
+server {
+    listen 80;
+    server_name bridge-api.YOURDOMAIN;
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name bridge-api.YOURDOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/bridge-api.YOURDOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bridge-api.YOURDOMAIN/privkey.pem;
+
+    # Real IP from Cloudflare
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 172.67.0.0/16;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 2400:cb00::/32;
+    set_realip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2405:8100::/32;
+    real_ip_header CF-Connecting-IP;
+
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Content-Type-Options nosniff always;
+
+    client_max_body_size 100M;
+    client_body_timeout 120s;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+
+    gzip on;
+    gzip_min_length 1000;
+    gzip_types application/json text/plain;
+
+    location /v1/upload {
+        if ($request_method = OPTIONS) {
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header 'Access-Control-Allow-Methods' 'POST, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type' always;
+            return 204;
+        }
+        client_body_timeout 120s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass http://telegram_bridge;
+        proxy_set_header Host $host;
+        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+    }
+
+    location / {
+        proxy_pass http://telegram_bridge;
+        proxy_set_header Host $host;
+        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+    }
+
+    location /docs { proxy_pass http://telegram_bridge; }
+    location = /openapi.json { proxy_pass http://telegram_bridge; }
+    location ~ /\\. { deny all; }
+}
+NGINX
+```
+
+**Step 8d**: Reload nginx:
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Phase 9: Cloudflare DNS Setup
+
+In your Cloudflare dashboard:
+
+| Type | Name | Content | Proxy Status |
+|------|------|---------|--------------|
+| A | origin-api | YOUR_VPS_IP | **DNS only** (grey cloud ☁️) |
+| A | bridge-api | YOUR_VPS_IP | **Proxied** (orange cloud �) |
+
+**Grey cloud** = DNS points directly to VPS. No CDN, no proxy, no 100MB limit.
+**Orange cloud** = Traffic goes through Cloudflare CDN. 100MB upload limit applies.
+
+### Phase 10: Firewall
+
+```bash
+# SSH
+sudo ufw allow 22/tcp
+
+# HTTP/HTTPS (from anywhere — Cloudflare and clients need this)
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# Enable
+sudo ufw enable
+```
+
+**Do NOT open port 9000 to the public.** Port 9000 is only accessed by nginx locally (`127.0.0.1:9000`). All external traffic comes through 443 → nginx → 9000.
+
+### Phase 11: Testing
+
+```bash
+# Local test
+curl http://127.0.0.1:9000/health
+
+# Through origin-api (grey cloud)
+curl https://origin-api.YOURDOMAIN/health
+curl https://origin-api.YOURDOMAIN/v1/stats -H "X-API-Key: your-secret"
+
+# Through bridge-api (orange cloud / CF proxy)
+curl https://bridge-api.YOURDOMAIN/health
+curl https://bridge-api.YOURDOMAIN/v1/stats -H "X-API-Key: your-secret"
+
+# CORS preflight test (critical!)
+curl -X OPTIONS \
+  -H "Origin: https://your-app.pages.dev" \
+  -H "Access-Control-Request-Method: GET" \
+  -H "Access-Control-Request-Headers: X-API-Key,Content-Type" \
+  -v https://origin-api.YOURDOMAIN/v1/stats | grep -i access-control
+
+# Upload test
+echo "test content" > /tmp/upload_test.txt
+curl -X POST https://origin-api.YOURDOMAIN/v1/upload \
+  -H "X-API-Key: your-secret" \
+  -F "file=@/tmp/upload_test.txt" \
+  -F "app_id=test"
+```
+
+### Phase 12: Deploy a Test Page
+
+```bash
+cd ~/bridge-diag  # or any test HTML directory
+wrangler pages deploy . --project-name bridge-diag
+```
+
+Test page should:
+- Use `XMLHttpRequest` (not `fetch()`) for cross-origin requests
+- Try `origin-api` first, fallback to `bridge-api` on error
+- Send proper `FormData` with field name `file` (not raw blob)
+- Use 30-second timeout for slow connections
+
+### Quick Reference: Nginx Config Checksum
+
+After setup, run:
+```bash
+sudo nginx -t && echo "✅ Nginx config OK"
+sudo systemctl is-active telegram-bridge && echo "✅ Bridge running"
+sudo systemctl is-active nginx && echo "✅ Nginx running"
+```
+
+### Troubleshooting Quick Fixes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 502 Bad Gateway | Bridge not running or wrong port | `sudo systemctl restart telegram-bridge` |
+| 405 Method Not Allowed | OPTIONS hitting POST-only route | Add `if ($request_method = OPTIONS)` block in nginx location |
+| CORS error in browser | Duplicate headers or missing headers | Check: is CORSMiddleware FIRST middleware? Is nginx adding duplicate CORS? |
+| "Could not connect" from BD ISP | Cloudflare blocked | Use origin-api (grey cloud) instead of bridge-api |
+| 413 Request Entity Too Large | Cloudflare 100MB limit | Use origin-api (grey cloud) for uploads >100MB |
+| Slow uploads from BD | ISP throttling | Normal for BD; use grey cloud, not CF proxy |
+| `venv` broken after Python upgrade | Broken symlinks | Recreate venv: `rm -rf venv && python3 -m venv venv && pip install -r requirements.txt` |
