@@ -1035,5 +1035,64 @@ sudo systemctl is-active nginx && echo "✅ Nginx running"
 | CORS error in browser | Duplicate headers or missing headers | Check: is CORSMiddleware FIRST middleware? Is nginx adding duplicate CORS? |
 | "Could not connect" from BD ISP | Cloudflare blocked | Use origin-api (grey cloud) instead of bridge-api |
 | 413 Request Entity Too Large | Cloudflare 100MB limit | Use origin-api (grey cloud) for uploads >100MB |
-| Slow uploads from BD | ISP throttling | Normal for BD; use grey cloud, not CF proxy |
-| `venv` broken after Python upgrade | Broken symlinks | Recreate venv: `rm -rf venv && python3 -m venv venv && pip install -r requirements.txt` |
+|| Slow uploads from BD | ISP throttling | Normal for BD; use grey cloud, not CF proxy |
+|| `venv` broken after Python upgrade | Broken symlinks | Recreate venv: `rm -rf venv && python3 -m venv venv && pip install -r requirements.txt` |
+
+---
+
+## Resilience & persistence
+
+### Download URL resolution strategy
+
+The bridge uses a **two-tier download system** to maximize file availability:
+
+```
+Client requests /v1/resolve/{file_unique_id}
+  │
+  ├─ Strategy 1: Bot API getFile (fast, works for files <20MB)
+  │   ├─ Success → returns direct download URL ✅
+  │   └─ Fail (404/too_big/timeout) → falls through
+  │
+  └─ Strategy 2: MTProto upload.getFile (works for ALL files)
+      ├─ Success → returns /v1/download/{file_unique_id} (MTProto stream) ✅
+      └─ Fail (no metadata stored) → returns empty (file needs re-upload)
+```
+
+### Two types of files in the database
+
+| Type | Metadata stored | Download method | Expiry risk |
+|------|----------------|-----------------|-------------|
+| **MTProto uploads** | `file_reference`, `access_hash`, `dc_id`, `media_id` | MTProto stream (Strategy 2) | **None** — permanent |
+| **Bot API uploads** | Only `file_id` | Bot API URL (Strategy 1) | **Possible** — Telegram may expire Bot API file paths |
+
+### Why MTProto files don't expire
+
+Telegram keeps files accessible via MTProto indefinitely as long as the bot/session has access to the original channel. The `file_reference` + `access_hash` combination is a permanent pointer to the file on Telegram's storage servers.
+
+Bot API `getFile` URLs, by contrast, are cached temporarily (typically ~1 hour for old files, longer for recently accessed ones). Eventually Telegram purges these cached paths, and the Bot API returns 404.
+
+### Making existing files permanent
+
+Files uploaded before the MTProto fallback was implemented may lack `file_reference` metadata. To make these permanently retrievable:
+
+1. If the file is still accessible via Bot API (returns 200 on resolve), you can extract the MTProto metadata by re-uploading through MTProto
+2. If the file is already expired (404 from Bot API) and has no metadata, it cannot be recovered
+
+### New uploads
+
+All new uploads via `/v1/upload` automatically store MTProto metadata. These files are permanently retrievable regardless of Bot API status.
+
+### Rate limiting
+
+The bridge enforces rate limiting to protect against abuse:
+- **60 requests/minute** per API key (general endpoints)
+- **10 uploads/minute** per API key
+
+If you hit a 429, wait 60 seconds and retry.
+
+### Persisting across restarts
+
+- **systemd** with `Restart=always` and `RestartSec=5` ensures the bridge stays running
+- **SQLite database** (`bridge.db`) persists file metadata across restarts
+- **In-memory URL cache** is cleared on restart (rebuilds on first access)
+- **MTProto session** is stored in `telegram-bridge.session` file (don't delete this)

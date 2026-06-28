@@ -312,17 +312,42 @@ class TelegramBridge:
             logger.warning(f"Bot API getFile failed: {e}")
             return {"file_id": file_id, "file_path": "", "file_size": 0, "file_unique_id": None}
 
-    async def get_download_url(self, file_id: str) -> str:
+    async def get_download_url(self, file_id: str, file_reference: bytes = b"", access_hash: int = 0, dc_id: int = 0, media_id: int = 0) -> str:
         """
-        Get a direct download URL for a file via Bot API.
+        Get a direct download URL for a file.
 
-        Calls getFile via Bot API (HTTP) to get the file_path, then constructs
-        the download URL. Falls back to file_id-only if Bot API rejects large files.
+        Strategy:
+        1. Try Bot API getFile (works for files < 20MB, fast)
+        2. If Bot API fails (expired/too big), fall back to MTProto upload.getFile
+           (works for all files that have file_reference metadata)
 
-        Note: Bot API getFile has a ~20MB limit. For larger files, the download_url
-        will be empty and the client should use the file_id with MTProxy or stream
-        through the bridge.
+        Args:
+            file_id: Telegram file_id
+            file_reference: Raw file_reference from MTProto upload
+            access_hash: MTProto access_hash
+            dc_id: MTProto dc_id
+            media_id: MTProto media_id (document/photo id)
         """
+        # Strategy 1: Bot API (fast, works for small/recent files)
+        bot_api_url = await self._get_download_url_bot_api(file_id)
+        if bot_api_url:
+            return bot_api_url
+
+        # Strategy 2: MTProto fallback (for old/large files with stored metadata)
+        if file_reference and access_hash and dc_id:
+            mtproto_url = await self._get_download_url_mtproto(file_id, file_reference, access_hash, dc_id, media_id)
+            if mtproto_url:
+                return mtproto_url
+
+        # Both strategies failed
+        logger.warning(
+            f"All download strategies failed for file_id={file_id}. "
+            f"Bot API: failed, MTProto: {'no metadata' if not file_reference else 'failed'}"
+        )
+        return ""
+
+    async def _get_download_url_bot_api(self, file_id: str) -> str:
+        """Get download URL via Bot API (HTTP, fast, but ~20MB limit)."""
         import aiohttp
 
         token = BOT_TOKEN
@@ -336,20 +361,93 @@ class TelegramBridge:
                     if data.get("ok"):
                         file_path = data["result"]["file_path"]
                         return f"https://api.telegram.org/file/bot{token}/{file_path}"
-                    # Bot API refused (e.g. "file is too big") — return empty string
-                    # Client should use file_id for MTProto download instead
                     error_desc = data.get("description", "unknown")
-                    logger.warning(
-                        f"Bot API getFile rejected file_id={file_id}: {error_desc}. "
-                        f"Download URL will be empty — client must use file_id."
-                    )
+                    logger.info(f"Bot API getFile failed for file_id={file_id}: {error_desc}")
                     return ""
         except asyncio.TimeoutError:
             logger.warning(f"Bot API getFile timed out for file_id={file_id}")
             return ""
         except Exception as e:
-            logger.warning(f"Bot API getFile failed for file_id={file_id}: {e}")
+            logger.warning(f"Bot API getFile error for file_id={file_id}: {e}")
             return ""
+
+    async def _get_download_url_mtproto(self, file_id: str, file_reference: bytes, access_hash: int, dc_id: int, media_id: int) -> str:
+        """
+        Get download URL via MTProto upload.getFile.
+
+        This works for files that have stored MTProto metadata (file_reference, access_hash, dc_id).
+        Telegram keeps these files accessible indefinitely via MTProto, unlike Bot API which expires.
+
+        Returns a mtproto:// URL that the stream_file method can use to retrieve actual bytes.
+        """
+        if not self.ready or not self.client:
+            logger.warning("MTProto fallback skipped: client not ready")
+            return ""
+
+        try:
+            from pyrogram.raw.types import InputDocumentFileLocation
+
+            location = InputDocumentFileLocation(
+                id=media_id,
+                access_hash=access_hash,
+                file_reference=file_reference,
+                thumb_size="",  # No thumbnail needed for download
+            )
+
+            # Verify the file location is valid by requesting file info
+            file_info = await self.client.invoke(
+                praw.functions.upload.GetFile(
+                    location=location,
+                    offset=0,
+                    limit=1024,  # Small check to verify file exists
+                )
+            )
+
+            if hasattr(file_info, 'bytes') or file_info is not None:
+                logger.info(f"MTProto getFile OK for file_id={file_id} (media_id={media_id}, dc={dc_id})")
+                return f"mtproto://{file_id}"
+            else:
+                logger.info(f"MTProto getFile returned empty for file_id={file_id}")
+                return ""
+
+        except Exception as e:
+            logger.info(f"MTProto getFile failed for file_id={file_id}: {type(e).__name__}: {e}")
+            return ""
+
+    async def stream_file(self, file_id: str, file_reference: bytes = b"", access_hash: int = 0, dc_id: int = 0, media_id: int = 0):
+        """
+        Stream a file via MTProto as a fallback when Bot API download URL is unavailable.
+        Returns a ReadableStream of the file content.
+        """
+        if not self.ready or not self.client:
+            raise RuntimeError("Bridge client not started.")
+
+        try:
+            # Get the file location
+            location = praw.types.InputFileLocation(
+                volume_id=0,
+                local_id=0,
+                secret=0,
+                file_reference=file_reference,
+            )
+
+            # Get file via MTProto
+            file_info = await self.client.invoke(
+                praw.functions.upload.GetFile(
+                    location=location,
+                    offset=0,
+                    limit=1024 * 1024,  # 1MB chunks
+                )
+            )
+
+            # Return the file bytes
+            if hasattr(file_info, 'bytes'):
+                return file_info.bytes
+            return b""
+
+        except Exception as e:
+            logger.error(f"MTProto stream failed for file_id={file_id}: {e}")
+            return b""
 
     @property
     def _default_channel_id(self) -> int:

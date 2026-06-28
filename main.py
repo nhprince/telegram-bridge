@@ -549,6 +549,7 @@ async def list_folders_endpoint(
 
 @app.get("/v1/resolve/{file_unique_id}", response_model=ApiResponse, tags=["Files"])
 async def resolve_file(
+    request: Request,
     file_unique_id: str,
     app_id: str = Query(...),
     api_key: str = Depends(verify_api_key),
@@ -558,13 +559,28 @@ async def resolve_file(
     if not upload:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Try cache first, then fall back to Bot API
+    # Try cache first, then fall back to Bot API with MTProto metadata
+    host = request.url.hostname
     download_url = url_cache.get(file_unique_id)
     if not download_url:
-        download_url = await bridge.get_download_url(upload["file_id"])
+        download_url = await bridge.get_download_url(
+            file_id=upload["file_id"],
+            file_reference=upload.get("file_reference", b""),
+            access_hash=upload.get("access_hash", 0),
+            dc_id=upload.get("dc_id", 0),
+            media_id=upload.get("media_id", 0),
+        )
         url_cache.set(file_unique_id, download_url)
 
     increment_download_count(file_unique_id)
+
+    # If no download_url available but we have MTProto metadata, return stream URL
+    if not download_url:
+        access_hash = upload.get("access_hash", 0) or 0
+        media_id = upload.get("media_id", 0) or 0
+        file_reference = upload.get("file_reference", b"") or b""
+        if access_hash and media_id and file_reference:
+            download_url = f"https://{host}/v1/download/{file_unique_id}?app_id={app_id}"
 
     return JSONResponse({
         "success": True,
@@ -584,7 +600,6 @@ async def download_file(
     """
     Stream a file download from Telegram via MTProto.
     Works for ALL file sizes (no Bot API 20MB limit).
-    Uses Pyrogram's get_file which streams directly from Telegram DCs.
     Falls back to Bot API redirect for old files without access_hash.
     """
     upload = get_upload(file_unique_id, app_id=app_id)
@@ -603,17 +618,23 @@ async def download_file(
     # Increment download count
     increment_download_count(file_unique_id)
 
-    if not access_hash or not media_id:
+    if not access_hash or not media_id or not file_reference:
         # Fallback for old uploads: try Bot API (works for files ≤20MB)
         download_url = url_cache.get(file_unique_id)
         if not download_url:
             try:
-                download_url = await bridge.get_download_url(file_id_int)
+                download_url = await bridge.get_download_url(
+                    file_id=file_id_int,
+                    file_reference=file_reference,
+                    access_hash=access_hash,
+                    dc_id=dc_id,
+                    media_id=media_id,
+                )
                 if download_url:
                     url_cache.set(file_unique_id, download_url)
             except Exception:
                 download_url = ""
-        if download_url:
+        if download_url and not download_url.startswith("mtproto://"):
             return RedirectResponse(url=download_url)
         raise HTTPException(
             status_code=404,
